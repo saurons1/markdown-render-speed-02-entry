@@ -475,17 +475,19 @@ function tryList(s) {
     if (!t || RE.hr.test(e)) break;
     const startOff = consumed();
     e = e.substring(t[0].length);
-    let g = t[2].split('\n', 1)[0];
+    const gEnd = t[2].indexOf('\n');
+    let g = gEnd === -1 ? t[2] : t[2].slice(0, gEnd);
     const b = t[1].length;
-    let line = g.replace(LEADING_WS, (v) => expandTabs(v, b));
-    const nextLine = e.split('\n', 1)[0];
-    const isEmpty = !line.trim();
+    let line = g.charCodeAt(0) === 32 || g.charCodeAt(0) === 9 ? g.replace(LEADING_WS, (v) => expandTabs(v, b)) : g;
+    const nlIdx = e.indexOf('\n');
+    const nextLine = nlIdx === -1 ? e : e.slice(0, nlIdx);
+    const lineNs = line.search(NON_SPACE);
+    const isEmpty = lineNs === -1;
     let indent;
     if (isEmpty) {
       indent = b + 1;
     } else {
-      indent = line.search(NON_SPACE);
-      indent = indent > 4 ? 1 : indent;
+      indent = lineNs > 4 ? 1 : lineNs;
       d = line.slice(indent);
       indent += b;
     }
@@ -506,16 +508,31 @@ function tryList(s) {
       const bq = blockquoteBeginRe(ri);
       let blankPrev = isEmpty;
       while (e) {
-        const cur = e.split('\n', 1)[0];
+        const nl = e.indexOf('\n');
+        const cur = nl === -1 ? e : e.slice(0, nl);
         const f = cur;
-        const z = f.replace(LEADING_WS, (ws) => expandTabs(ws));
-        if (fb.test(f) || hb.test(f) || ht.test(f) || bq.test(f) || nb.test(f) || hrR.test(f)) break;
-        if (z.search(NON_SPACE) >= indent || !f.trim()) {
+        const z = f.charCodeAt(0) === 32 || f.charCodeAt(0) === 9 ? f.replace(LEADING_WS, (ws) => expandTabs(ws)) : f;
+        // Only test the block-start regexes a line can actually match,
+        // keyed by its first non-space character.
+        const firstNs = z.search(NON_SPACE);
+        if (firstNs !== -1 && firstNs <= ri) {
+          const fc = z.charCodeAt(firstNs);
+          if (
+            (fc === 96 || fc === 126 ? fb.test(f) : false) ||
+            (fc === 35 ? hb.test(f) : false) ||
+            (fc === 60 ? ht.test(f) : false) ||
+            (fc === 62 ? bq.test(f) : false) ||
+            (fc === 42 || fc === 43 || fc === 45 || (fc >= 48 && fc <= 57) ? nb.test(f) || hrR.test(f) : false) ||
+            (fc === 95 ? hrR.test(f) : false)
+          )
+            break;
+        }
+        if (firstNs >= indent || firstNs === -1) {
           d += '\n' + z.slice(indent);
         } else {
           if (
             blankPrev ||
-            line.replace(/\t/g, '    ').search(NON_SPACE) >= 4 ||
+            (line.includes('\t') ? line.replace(/\t/g, '    ') : line).search(NON_SPACE) >= 4 ||
             fb.test(line) ||
             hb.test(line) ||
             ht.test(line) ||
@@ -528,9 +545,9 @@ function tryList(s) {
               : f;
           d += '\n' + qe;
         }
-        blankPrev = !f.trim();
+        blankPrev = firstNs === -1;
         line = z.slice(indent);
-        e = e.substring(cur.length + 1);
+        e = nl === -1 ? '' : e.substring(nl + 1);
       }
     }
     const itemRaw = src.slice(startOff, consumed());
@@ -683,7 +700,17 @@ function blockParse(src, out = [], mergePara = false) {
       }
     }
     let tb;
-    if ((tb = RE.table.exec(s)) && TABLE_DELIM.test(tb[2])) {
+    // Table: the delimiter must be the second line, so only test that
+    // line (a whole-document scan here would be quadratic in doc size).
+    let line2 = null;
+    {
+      const nl1 = s.indexOf('\n');
+      if (nl1 !== -1) {
+        const nl2 = s.indexOf('\n', nl1 + 1);
+        line2 = nl2 === -1 ? s.slice(nl1 + 1) : s.slice(nl1 + 1, nl2);
+      }
+    }
+    if (line2 !== null && /^ {0,3}(?:\| *)?:?-/.test(line2) && (tb = RE.table.exec(s)) && TABLE_DELIM.test(tb[2])) {
       const header = splitRow(tb[1]);
       const delim = tb[2].replace(TABLE_ALIGN_CHARS, '').split('|');
       if (header.length === delim.length) {
@@ -701,7 +728,14 @@ function blockParse(src, out = [], mergePara = false) {
         continue;
       }
     }
-    if ((m = RE.setext.exec(s))) {
+    // Setext: the marker must be inside the current paragraph, so only
+    // scan up to the next blank line (never the whole rest of the doc).
+    let paraSlice = s;
+    {
+      const be = /\n[ \t]*\n/.exec(s);
+      if (be) paraSlice = s.slice(0, be.index);
+    }
+    if (/\n {0,3}[=-]/.test(paraSlice) && (m = RE.setext.exec(s))) {
       out.push({
         t: 'heading',
         raw: stripTail(m[0], '\n'),
@@ -1055,9 +1089,22 @@ function tryUrl(rem, plain) {
 // Scan one plain-text run starting at `pos`. Stops before any character
 // that can start an inline token, a www./protocol/email/mailto: start, or
 // a hard-break run of spaces. Always consumes at least one character.
+// Hot path: the per-character work is plain comparisons only; the
+// lookahead regexes run solely at positions that can actually start one.
 const EMAIL_LOCAL = "A-Za-z0-9.!#$%&'*+/=?^_`{|}~-";
-const EMAIL_START = new RegExp(`^[${EMAIL_LOCAL}]+@`);
-const PROTO_START = /^[hH][tT][tT][pP][sS]?[fF]?[tT]?[pP]?:\/\//;
+const STOP_RE = new RegExp(
+  '[\\\\`<\\[!*_~]' +
+    '| {2,}(?=\\n)' +
+    '|(?<![^\\s*_~(])www\\.' +
+    '|(?:[hH][tT][tT][pP][sS]?|[fF][tT][pP]):\\/\\/' +
+    '|(?<![A-Za-z0-9])(?:mailto:|xmpp:)' +
+    '|(?<![' +
+    EMAIL_LOCAL +
+    '])[' +
+    EMAIL_LOCAL +
+    ']+@',
+  'g',
+);
 function textRun(src, pos) {
   const start = pos;
   const n = src.length;
@@ -1067,33 +1114,18 @@ function textRun(src, pos) {
     const c = src[pos];
     while (pos < n && src[pos] === c) pos++;
   }
-  while (pos < n) {
-    const c = src[pos];
-    if (pos > start) {
-      if (
-        c === '\\' || c === '`' || c === '<' || c === '!' || c === '[' ||
-        c === '*' || c === '_' || c === '~'
-      )
-        break;
-      if (c === ' ' && /^ {2,}\n/.test(src.slice(pos))) break;
-      if (c === 'w' && src.startsWith('www.', pos)) {
-        const p = pos === 0 ? '' : src[pos - 1];
-        if (pos === 0 || p === ' ' || p === '\t' || p === '\n' || p === '*' || p === '_' || p === '~' || p === '(' || p === '[') break;
-      }
-      if ((c === 'h' || c === 'H' || c === 'f' || c === 'F') && PROTO_START.test(src.slice(pos))) break;
-      if ((c === 'm' || c === 'x') && (src.startsWith('mailto:', pos) || src.startsWith('xmpp:', pos))) {
-        const p = src[pos - 1];
-        if (!/[A-Za-z0-9]/.test(p)) break;
-      }
-      if (EMAIL_START.test(src.slice(pos))) {
-        const p = src[pos - 1];
-        if (!new RegExp(`^[${EMAIL_LOCAL}]$`).test(p)) break;
-      }
-    }
+  STOP_RE.lastIndex = pos;
+  let m = STOP_RE.exec(src);
+  let end = m ? m.index : n;
+  if (end === start) {
+    // The stop is at the run's start (a token failed here): consume one
+    // character and look again.
     pos++;
+    STOP_RE.lastIndex = pos;
+    m = STOP_RE.exec(src);
+    end = m ? m.index : n;
   }
-  if (pos === start) pos++;
-  return { text: src.slice(start, pos), len: pos - start };
+  return { text: src.slice(start, end), len: end - start };
 }
 
 // The inline loop. `plain` renders with text-renderer semantics (for image
@@ -1111,9 +1143,12 @@ function inlineLoop(src, plain) {
 
 function inlineBody(src, plain) {
   const hasDelim = src.includes('*') || src.includes('_') || src.includes('~');
-  const masked = hasDelim ? maskEm(src) : src;
+  // The masked source (for emphasis matching) is built lazily: many
+  // paragraphs contain a delimiter only inside a code span or a link.
+  let masked = null;
+  const getMasked = () => (masked ?? (masked = hasDelim ? maskEm(src) : src));
   let closers = null;
-  const getClosers = () => (closers ?? (closers = lastClosers(masked)));
+  const getClosers = () => (closers ?? (closers = lastClosers(getMasked())));
   let out = '';
   let buf = '';
   let prevChar = '';
@@ -1134,40 +1169,59 @@ function inlineBody(src, plain) {
   };
   while (pos < src.length) {
     const rem = src.slice(pos);
+    const c0 = rem.charCodeAt(0);
     let tok = null;
     let m;
-    if ((m = INLINE.escape.exec(rem))) {
-      tok = { html: plain ? m[1] : esc(m[1]), len: m[0].length };
-    } else if ((m = INLINE.tag.exec(rem))) {
-      // The tag's state changes (<a> / <pre> etc.) apply only AFTER the
-      // pending text is flushed: that text was scanned under the old state.
-      let setInLink = null;
-      let setInRaw = null;
-      if (!ST.inLink && /^<a /i.test(m[0])) setInLink = true;
-      else if (ST.inLink && /^<\/a>/i.test(m[0])) setInLink = false;
-      if (!ST.inRawBlock && /^<(pre|code|kbd|script)(\s|>)/i.test(m[0])) setInRaw = true;
-      else if (ST.inRawBlock && /^<\/(pre|code|kbd|script)(\s|>)/i.test(m[0])) setInRaw = false;
-      tok = { html: m[0], len: m[0].length, setInLink, setInRaw };
-    } else if ((tok = tryLink(rem, plain))) {
-      // handled below
-    } else if ((tok = tryReflink(rem, plain))) {
-      // handled below
-    } else if (hasDelim && (tok = tryEmStrong(rem, masked, getClosers(), prevChar, plain))) {
-      // handled below
-    } else if ((m = INLINE.code.exec(rem))) {
-      let content = m[2].replace(/\n/g, ' ');
-      if (/[^ ]/.test(content) && content.charAt(0) === ' ' && content.charAt(content.length - 1) === ' ') {
-        content = content.substring(1, content.length - 1);
+    // Dispatch on the first character: each tokenizer can only match at
+    // its own opening character, so most regexes are never even tried.
+    if (c0 === 92) {
+      // backslash: escape, or a hard break before a newline
+      if ((m = INLINE.escape.exec(rem))) {
+        tok = { html: plain ? m[1] : esc(m[1]), len: m[0].length };
+      } else if ((m = INLINE.br.exec(rem))) {
+        tok = { html: plain ? '' : '<br>', len: m[0].length };
       }
-      tok = { html: plain ? content : '<code>' + esc(content, true) + '</code>', len: m[0].length };
-    } else if ((m = INLINE.br.exec(rem))) {
-      tok = { html: plain ? '' : '<br>', len: m[0].length };
-    } else if (hasDelim && (tok = tryDel(rem, masked, getClosers(), prevChar, plain))) {
-      // handled below
-    } else if ((tok = tryAutolink(rem, plain))) {
-      // handled below
-    } else if (!ST.inLink && (tok = tryUrl(rem, plain))) {
-      // handled below
+    } else if (c0 === 60) {
+      // '<': tag or autolink
+      if ((m = INLINE.tag.exec(rem))) {
+        // The tag's state changes (<a> / <pre> etc.) apply only AFTER the
+        // pending text is flushed: that text was scanned under the old state.
+        let setInLink = null;
+        let setInRaw = null;
+        if (!ST.inLink && /^<a /i.test(m[0])) setInLink = true;
+        else if (ST.inLink && /^<\/a>/i.test(m[0])) setInLink = false;
+        if (!ST.inRawBlock && /^<(pre|code|kbd|script)(\s|>)/i.test(m[0])) setInRaw = true;
+        else if (ST.inRawBlock && /^<\/(pre|code|kbd|script)(\s|>)/i.test(m[0])) setInRaw = false;
+        tok = { html: m[0], len: m[0].length, setInLink, setInRaw };
+      } else if ((tok = tryAutolink(rem, plain))) {
+        // handled below
+      }
+    } else if (c0 === 91 || c0 === 33) {
+      // '[' or '!': link or reference link
+      tok = tryLink(rem, plain) || tryReflink(rem, plain);
+    } else if (c0 === 42 || c0 === 95) {
+      // '*' or '_': emphasis / strong
+      if (hasDelim) tok = tryEmStrong(rem, getMasked(), getClosers(), prevChar, plain);
+    } else if (c0 === 96) {
+      // backtick: code span
+      if ((m = INLINE.code.exec(rem))) {
+        let content = m[2].replace(/\n/g, ' ');
+        if (/[^ ]/.test(content) && content.charAt(0) === ' ' && content.charAt(content.length - 1) === ' ') {
+          content = content.substring(1, content.length - 1);
+        }
+        tok = { html: plain ? content : '<code>' + esc(content, true) + '</code>', len: m[0].length };
+      }
+    } else if (c0 === 32) {
+      // space: hard break (two or more spaces before a newline)
+      if ((m = INLINE.br.exec(rem))) {
+        tok = { html: plain ? '' : '<br>', len: m[0].length };
+      }
+    } else if (c0 === 126) {
+      // '~': strikethrough
+      if (hasDelim) tok = tryDel(rem, getMasked(), getClosers(), prevChar, plain);
+    } else if (!ST.inLink && ((c0 >= 48 && c0 <= 57) || (c0 >= 65 && c0 <= 90) || (c0 >= 97 && c0 <= 122))) {
+      // alphanumerics: extended autolink (www. / scheme / email)
+      tok = tryUrl(rem, plain);
     }
     if (tok) {
       if (tok.isText) {
